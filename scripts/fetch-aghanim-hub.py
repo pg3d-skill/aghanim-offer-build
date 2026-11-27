@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Read live Aghanim hub state from the hub JSON API as a guest.
+"""Read live Aghanim hub state from the hub JSON API — as a signed-in player or as a guest.
 
-Zero dependencies: Python 3.9+ standard library.
+Before any work the install is compared with its GitHub repository (scripts/check-repo.mjs); a drifted
+install is updated to the repository version — the update itself runs scripts/setup.py when the repository
+carries one — and the script starts again as the new version. A guest sees only untargeted
+positions, so the script asks whose eyes to look through: --player <User ID> signs in the way the hub's
+own login form does, --guest keeps the guest view. The session token lives in memory only.
+
+Zero dependencies: Python 3.9+ standard library (the repository check needs node 18+).
 """
 import argparse
 import concurrent.futures
@@ -9,7 +15,10 @@ import datetime
 import gzip
 import html
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -24,6 +33,9 @@ else:
     SKILL_DIR = HERE
 HUBS_FILE = SKILL_DIR / 'catalog' / 'hubs.json'
 IMAGE_API_FILE = SKILL_DIR / 'catalog' / 'image-api.json'
+REPO_CHECK = SKILL_DIR / 'scripts' / 'check-repo.mjs'
+GATE_ENV = 'AGHANIM_REPO_GATE'
+PLAYER_ENV = 'AGHANIM_HUB_PLAYER'
 API_ORIGIN = 'https://hub-api.aghanim.com'
 USER_AGENT = 'aghanim-offer-building (PG3D liveops)'
 CONTEXT_MARK = 'window.$_HUB_CURRENT_CONTEXT='
@@ -59,9 +71,11 @@ class Blocked(Exception):
         self.reason = reason
 
 
-def http_get(url, headers):
-    """-> (status, text); Blocked(dependency_down) when the host does not answer."""
-    request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, 'Accept-Encoding': 'gzip', **headers})
+def http_get(url, headers, body=None):
+    """-> (status, text); Blocked(dependency_down) when the host does not answer. A body makes it a JSON POST."""
+    data = None if body is None else json.dumps(body).encode('utf-8')
+    extra = {} if body is None else {'Content-Type': 'application/json'}
+    request = urllib.request.Request(url, data=data, headers={'User-Agent': USER_AGENT, 'Accept-Encoding': 'gzip', **extra, **headers})
 
     def text_of(response):
         body = response.read()
@@ -87,6 +101,7 @@ class Hub:
         self.origin = origin
         self.domain = urllib.parse.urlsplit(origin).netloc
         self.country, self.locale, self.get = country, locale, get
+        self.viewer = None
         self.headers = {
             'Accept': 'application/json',
             'X-Locale': locale,
@@ -109,6 +124,25 @@ class Hub:
             return {'error': status, 'detail': str(data.get('detail') if isinstance(data, dict) else data)[:200]}
         return {'data': data}
 
+    def login(self, user_id):
+        """Signs in by game User ID, as the hub's login form does. The token is kept in memory and sent as Bearer."""
+        url = f'{API_ORIGIN}/hub/v1/websites/{self.domain}/auth/authorize_user_id'
+        user_id = user_id.strip().lower()
+        status, text = self.get(url, self.headers, {'user_id': user_id, 'is_auto_login': False})
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = {}
+        token = data.get('token') if isinstance(data, dict) else None
+        if status != 200 or not token:
+            detail = str(data.get('detail') or data.get('error_code') or '')[:200] if isinstance(data, dict) else ''
+            raise Blocked('missing_input', f'хаб {self.domain} не пустил игрока {mask(user_id)}: {status} {detail}'.strip()
+                          + ' — проверьте User ID (в игре: настройки) или смотрите гостем: --guest')
+        self.headers = {**self.headers, 'Authorization': f'Bearer {token}'}
+        user = data.get('user') if isinstance(data.get('user'), dict) else {}
+        self.viewer = {'player': mask(user_id), 'name': user.get('name'), 'level': user.get('level'), 'country': user.get('country')}
+        return self.viewer
+
     def page(self, path):
         """-> {'text': html} | {'error': status}"""
         try:
@@ -116,6 +150,55 @@ class Hub:
         except Blocked as error:
             return {'error': 'network', 'detail': str(error)}
         return {'text': text} if status == 200 else {'error': status}
+
+
+def mask(user_id):
+    """A User ID alone opens the hub account, so reports carry it shortened."""
+    text = str(user_id).strip()
+    return text if len(text) <= 4 else f'{text[:2]}…{text[-2:]}'
+
+
+def run_tool(command):
+    """-> (exit code, output); 127 when the tool did not start."""
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 127, str(error)
+    return done.returncode, f'{done.stdout or ''}{done.stderr or ''}'.strip()
+
+
+def repo_gate(run=run_tool, node=None):
+    """-> ('ok' | 'updated' | 'stop', text). Compares the install with its repository before any work; a drifted
+    install is brought to the repository version by check-repo.mjs --update, which also runs scripts/setup.py
+    when the repository carries one. Fail-closed: no node, no GitHub or a red update means stop."""
+    node = node or shutil.which('node')
+    if not node or not REPO_CHECK.exists():
+        return 'stop', 'Blocked: missing_input — сверка с репозиторием не запустилась: нужны node 18+ и scripts/check-repo.mjs; без сверки — только по прямому слову оператора: --no-repo-check'
+    code, text = run([node, str(REPO_CHECK)])
+    if code == 0:
+        return 'ok', ''
+    if code != 1:
+        return 'stop', text or 'Blocked: missing_input — сверка с репозиторием не ответила'
+    code, updated = run([node, str(REPO_CHECK), '--update'])
+    if code != 0:
+        return 'stop', updated
+    return 'updated', updated
+
+
+def ask_player(args, env=None, stdin=None, ask=input):
+    """-> User ID to sign in with, or None for the guest view. Nobody named and nobody to ask is a refusal:
+    a guest sees only untargeted positions, and a silent guest read reports a half-empty hub."""
+    env = os.environ if env is None else env
+    stdin = sys.stdin if stdin is None else stdin
+    if args.guest:
+        return None
+    named = args.player or env.get(PLAYER_ENV)
+    if named:
+        return named
+    if stdin is not None and stdin.isatty():
+        return ask('User ID игрока для входа на хаб (Enter — смотреть гостем): ').strip() or None
+    raise Blocked('missing_input', 'не названо, чьими глазами смотреть хаб: --player <User ID игрока> (или переменная '
+                  f'{PLAYER_ENV}) — вход как в форме хаба, видны офферы с таргетингом; --guest — гостем, только то, что открыто всем')
 
 
 def parallel(jobs):
@@ -312,6 +395,7 @@ def collect(hub, with_pages=True):
         'country': hub.country,
         'locale': hub.locale,
         'fetched_at': iso(started),
+        'viewer': hub.viewer,
         'site': {'title': website.get('title'), 'slug': website.get('slug'), 'id': website.get('id'), 'published_at': iso(website.get('published_at')), 'modified_at': iso(website.get('modified_at'))} if website else None,
         'menu': [{'type': e.get('type'), 'name': e.get('custom_name') or e.get('name'), 'slug': e.get('slug'), 'visible': e.get('visible')} for e in data['menu'] or []],
         'categories': [{'id': c['id'], 'slug': c.get('slug'), 'name': c.get('name'), 'position': c.get('position'), 'parent_id': c.get('parent_id')} for c in categories],
@@ -389,7 +473,13 @@ def report(snap, find=None):
         inner = [c.get(key) for c in item['contents'] + [r for g in item['lootbox'] for r in g['items']] for key in ('sku', 'name')]
         return any(needle in str(value).lower() for value in own + inner if value)
 
-    out = [f'Хаб {snap["hub"]} — данные API хаба глазами гостя; цены для страны {snap["country"]}, язык {snap["locale"]}; снято {snap["fetched_at"]}']
+    viewer = snap.get('viewer')
+    who, whom = ('игрока', 'игроку') if viewer else ('гостя', 'гостю')
+    eyes = 'глазами гостя'
+    if viewer:
+        facts = [f'{label} {viewer[key]}' for key, label in (('name', 'имя'), ('level', 'уровень'), ('country', 'страна')) if viewer.get(key) not in (None, '')]
+        eyes = f'глазами игрока {viewer["player"]}' + (f' ({", ".join(facts)})' if facts else '')
+    out = [f'Хаб {snap["hub"]} — данные API хаба {eyes}; цены для страны {snap["country"]}, язык {snap["locale"]}; снято {snap["fetched_at"]}']
     site = snap['site']
     if site:
         out.append(f'Сайт «{site["title"]}» ({site["slug"]}): опубликован {site["published_at"]}, последнее изменение {site["modified_at"]}')
@@ -425,7 +515,7 @@ def report(snap, find=None):
         hidden_total += len(hidden)
         if hidden:
             stale = sum(1 for item in hidden if item['expired'])
-            out.append(f'\nВ сторе {store_id} настроено, гостю не показывается: {len(hidden)} из {len(rows)} — с истёкшим сроком {stale}, для остальных причину API не называет (обычно таргетинг или условие)')
+            out.append(f'\nВ сторе {store_id} настроено, {whom} не показывается: {len(hidden)} из {len(rows)} — с истёкшим сроком {stale}, для остальных причину API не называет (обычно таргетинг или условие)')
             out.extend('  ' + item_line(item, True) for item in hidden)
     if needle and not items and not hidden_total:
         out.append(f'\nПо запросу «{find}» на хабе ничего не найдено')
@@ -444,7 +534,7 @@ def report(snap, find=None):
                     if key in ('block', 'start_at', 'end_at'):
                         continue
                     offer = snap['offers'].get(value)
-                    note = ' — гостю не отдаётся' if offer and offer['data'] is None else ''
+                    note = f' — {whom} не отдаётся' if offer and offer['data'] is None else ''
                     refs.append(f'{key}={value}{note}')
                 window = ' '.join(f'{label} {block[key]}' for key, label in (('start_at', 'с'), ('end_at', 'до')) if block.get(key))
                 blocks.append(block['block'] + (f' ({"; ".join(refs + ([window] if window else []))})' if refs or window else ''))
@@ -469,10 +559,10 @@ def report(snap, find=None):
     if snap['errors']:
         out.append('\nНе ответило: ' + '; '.join(snap['errors']))
     if not snap['items']:
-        out.append(f'Rejected: defects_found — API хаба {snap["hub"]} ответил, но у гостя на витрине нет ни одной позиции')
+        out.append(f'Rejected: defects_found — API хаба {snap["hub"]} ответил, но у {who} на витрине нет ни одной позиции')
         return False, '\n'.join(out)
     found = f'; по запросу «{find}» найдено {len(items) + hidden_total}' if needle else ''
-    out.append(f'Done: у гостя на витрине {len(snap["items"])} позиций в {filled} разделах, ещё {sum(1 for rows in snap["stores"].values() for i in rows if not i["guest_visible"])} настроено в сторе и гостю не показывается; страниц {len(snap["pages"])}; за {snap["seconds"]} с{found}')
+    out.append(f'Done: у {who} на витрине {len(snap["items"])} позиций в {filled} разделах, ещё {sum(1 for rows in snap["stores"].values() for i in rows if not i["guest_visible"])} настроено в сторе и {whom} не показывается; страниц {len(snap["pages"])}; за {snap["seconds"]} с{found}')
     return True, '\n'.join(out)
 
 
@@ -561,7 +651,7 @@ def run_selftest():
     }
     seen = []
 
-    def fake(url, headers):
+    def fake(url, headers, body=None):
         seen.append((url, headers))
         if url.endswith('/sitemap.xml'):
             return 200, '<loc>https://hub.test/ru/promo</loc><loc>https://hub.test/news/a/b</loc><loc>https://hub.test/ru</loc>'
@@ -598,10 +688,65 @@ def run_selftest():
         'image API seam reports missing fields by name': image_api()['connected'] or set(image_api()['missing']) <= {'base_url', 'secret_name'},
     }
     try:
-        collect(Hub('https://nohub.test', 'US', 'en', lambda url, headers: (404, '{"detail":"Website not found"}')))
+        collect(Hub('https://nohub.test', 'US', 'en', lambda url, headers, body=None: (404, '{"detail":"Website not found"}')))
         checks['unknown hub is Blocked: missing_input'] = False
     except Blocked as error:
         checks['unknown hub is Blocked: missing_input'] = error.reason == 'missing_input'
+    posted = []
+
+    def signing(url, headers, body=None):
+        if url.endswith('/auth/authorize_user_id'):
+            posted.append(body)
+            return (200, json.dumps({'token': 'tok-1', 'user': {'name': 'Neo', 'level': 7}})) if body['user_id'] == 'ab12cd' else (401, '{"detail":"unauthorized"}')
+        seen.append((url, headers))
+        return fake(url, headers)
+
+    member = Hub('https://hub.test', 'DE', 'ru', signing)
+    member.login(' AB12CD ')
+    seen.clear()
+    member_text = report(collect(member)[0])[1]
+    checks['sign-in posts the normalised User ID'] = posted == [{'user_id': 'ab12cd', 'is_auto_login': False}]
+    checks['player session sent as Bearer to the API only'] = all((h.get('Authorization') == 'Bearer tok-1') == ('hub-api' in u) for u, h in seen)
+    checks['report names the player shortened, never the token'] = 'глазами игрока ab…cd (имя Neo, уровень 7)' in member_text and 'tok-1' not in member_text and 'игроку не показывается' in member_text
+    try:
+        Hub('https://hub.test', 'DE', 'ru', signing).login('nobody')
+        checks['refused sign-in is Blocked: missing_input'] = False
+    except Blocked as error:
+        checks['refused sign-in is Blocked: missing_input'] = error.reason == 'missing_input' and 'no…dy' in str(error)
+
+    class Args:
+        def __init__(self, player=None, guest=False):
+            self.player, self.guest = player, guest
+
+    class Tty:
+        def __init__(self, tty):
+            self.tty = tty
+
+        def isatty(self):
+            return self.tty
+
+    checks['viewer: flag, env, prompt, guest'] = (
+        ask_player(Args(player='p1'), {}, Tty(False)) == 'p1' and ask_player(Args(), {PLAYER_ENV: 'p2'}, Tty(False)) == 'p2'
+        and ask_player(Args(guest=True), {PLAYER_ENV: 'p2'}, Tty(True)) is None
+        and ask_player(Args(), {}, Tty(True), lambda prompt: ' p3 ') == 'p3' and ask_player(Args(), {}, Tty(True), lambda prompt: '') is None)
+    try:
+        ask_player(Args(), {}, Tty(False))
+        checks['nobody named and nobody to ask is a refusal'] = False
+    except Blocked as error:
+        checks['nobody named and nobody to ask is a refusal'] = error.reason == 'missing_input' and '--guest' in str(error)
+
+    def gate(answers):
+        calls = []
+
+        def run(command):
+            calls.append(' '.join(Path(part).name if os.sep in part else part for part in command[1:]))
+            return answers[len(calls) - 1]
+        return repo_gate(run, 'node')[0], calls
+
+    checks['repo gate: matching install runs'] = gate([(0, 'Done')]) == ('ok', ['check-repo.mjs'])
+    checks['repo gate: drift is handed to check-repo --update, then restart'] = gate([(1, 'Rejected'), (0, 'Done')]) == ('updated', ['check-repo.mjs', 'check-repo.mjs --update'])
+    checks['repo gate: red update (setup.py, extra file) and no GitHub stop'] = [gate(a)[0] for a in ([(1, ''), (1, 'setup_failed')], [(2, 'Blocked')])] == ['stop', 'stop']
+
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         return False, 'Rejected: defects_found — самопроверка: ' + '; '.join(failed)
@@ -614,10 +759,13 @@ class Parser(argparse.ArgumentParser):
 
 
 def main(argv):
-    parser = Parser(description='Данные хаба Aghanim из API хаба: витрина, цены, состав, страницы, награды — без браузера и ключа.')
+    parser = Parser(description='Данные хаба Aghanim из API хаба: витрина, цены, состав, страницы, награды — без браузера и ключа; перед работой — сверка установки с репозиторием.')
     parser.add_argument('--hub', default='live', help='live или адрес хаба https://… (адреса — catalog/hubs.json)')
     parser.add_argument('--country', default='US', help='страна для цен и валюты, код ISO (US, DE, KZ…)')
     parser.add_argument('--locale', default='en', help='язык названий (en, ru, de…)')
+    parser.add_argument('--player', help=f'User ID игрока: вход на хаб как в его форме входа — видны офферы с таргетингом (или переменная {PLAYER_ENV})')
+    parser.add_argument('--guest', action='store_true', help='смотреть гостем, без входа: только то, что открыто всем')
+    parser.add_argument('--no-repo-check', action='store_true', help='пропустить сверку с репозиторием — только по прямому слову оператора')
     parser.add_argument('--find', help='оставить позиции, где SKU, название или состав содержат текст')
     parser.add_argument('--out', help='папка для снимка hub.json и сырых ответов API')
     parser.add_argument('--json', action='store_true', help='печатать снимок JSON вместо отчёта')
@@ -634,6 +782,17 @@ def main(argv):
         ok, text = run_selftest()
         print(text)
         return 0 if ok else 1
+    if args.no_repo_check:
+        print('сверка с репозиторием пропущена (--no-repo-check): команды могут расходиться с описанием скилла')
+    elif os.environ.get(GATE_ENV) != 'done':
+        state, text = repo_gate()
+        if text:
+            print(text, flush=True)
+        if state == 'stop':
+            return 2 if text.lstrip().startswith('Blocked') or '\nBlocked' in text else 1
+        if state == 'updated':
+            # The running process still holds the old code: start the updated script with the same arguments.
+            return subprocess.call([sys.executable, str(Path(__file__).resolve()), *argv], env={**os.environ, GATE_ENV: 'done'})
     if args.setup:
         code, text = run_setup()
         print(text)
@@ -642,7 +801,11 @@ def main(argv):
     result = 0
     try:
         origin = hub_origin(args.hub)
-        snapshot, raw = collect(Hub(origin, args.country.upper(), args.locale), not args.no_pages)
+        player = ask_player(args)
+        hub = Hub(origin, args.country.upper(), args.locale)
+        if player:
+            hub.login(player)
+        snapshot, raw = collect(hub, not args.no_pages)
         ok, text = report(snapshot, args.find)
         if args.json:
             text = json.dumps(snapshot, ensure_ascii=False, indent=1)

@@ -5,11 +5,13 @@
  *          the branch head and its tree, computes the git blob sha1 of every local file and compares. The
  *          skill's own memory — catalog snapshots, hub addresses, client path, image API seam — is never
  *          compared and never rewritten. --update downloads only the files that drifted or went missing,
- *          each verified against the sha the tree gave; nothing is ever deleted. Zero dependencies and no
+ *          each verified against the sha the tree gave; nothing is ever deleted. After an update that changed
+ *          files it runs scripts/setup.py when the repository carries one — a red setup makes the verdict red;
+ *          no setup.py means there is nothing more to run and the update stands. Zero dependencies and no
  *          git needed: the install is usually a plain copy, not a clone. Fail-closed — GitHub unreachable
  *          means the check does not pass, because an unverified install is what it guards against.
  * @route (без аргументов) — сверяет установленный скилл с репозиторием и печатает, что разошлось
- * @route --update — докачивает из репозитория разошедшиеся и пропавшие файлы; память скилла не трогает, ничего не удаляет
+ * @route --update — докачивает из репозитория разошедшиеся и пропавшие файлы и, если что-то обновилось, запускает `scripts/setup.py` (когда он есть); память скилла не трогает, ничего не удаляет
  * @route --selftest — самопроверка сравнения (офлайн, на синтетическом дереве)
  * @verdict "Done: …" exit 0 (сошлось) | "Rejected: defects_found — …" exit 1 (расхождение: что / почему / как исправить) |
  *          "Blocked: missing_input — …" exit 2 (GitHub недоступен, битый catalog/source.json)
@@ -19,6 +21,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -28,6 +31,8 @@ const SOURCE_FILE = path.join(CATALOG_DIR, 'source.json');
 const STATE_FILE = path.join(CATALOG_DIR, '.repo-check.json');
 const SKIP = ['.git', '.DS_Store', '__pycache__', 'node_modules', '.repo-check.json'];
 const TIMEOUT_MS = 20000;
+const SETUP_REL = 'scripts/setup.py';
+const SETUP_TIMEOUT_MS = 300000;
 const UA = 'aghanim-offer-building check-repo';
 const CMD = 'node <workspace>/.claude/skills/aghanim-offer-building/scripts/check-repo.mjs';
 
@@ -49,6 +54,11 @@ const CHECKS = {
     what: 'лишний файл в установке',
     why: 'его нет в репозитории: он не проверен, не обновляется и может оказаться старой версией того, что уже переехало',
     fix: 'удалить, если не нужен; если нужен — влить в репозиторий или записать в "local" в catalog/source.json',
+  },
+  setup_failed: {
+    what: 'проверка установки после обновления не прошла',
+    why: 'файлы обновились, но `scripts/setup.py` из репозитория не подтвердил, что установка рабочая: работать по ней — значит упасть посреди команды',
+    fix: 'прочитать вывод setup.py выше и устранить названное; затем запустить его снова: `python3 <workspace>/.claude/skills/aghanim-offer-building/scripts/setup.py`',
   },
   source_shape: {
     what: 'catalog/source.json не той формы',
@@ -146,6 +156,27 @@ async function fetchRemote(src) {
   return { commit, files };
 }
 
+/** One python launcher attempt. @param {string} bin @param {string[]} args */
+const launch = (bin, args) => spawnSync(bin, args, { encoding: 'utf8', timeout: SETUP_TIMEOUT_MS });
+
+/**
+ * Runs scripts/setup.py of the freshly updated install. No setup.py in the install is not a defect: there is
+ * nothing more to check and the update stands.
+ * @param {string} dir @param {(bin: string, args: string[]) => {status: number|null, stdout?: string, stderr?: string, error?: Error}} [spawn]
+ * @returns {{ran: boolean, ok: boolean, text: string}}
+ */
+function runSetup(dir, spawn = launch) {
+  const file = path.join(dir, ...SETUP_REL.split('/'));
+  if (!fs.existsSync(file)) return { ran: false, ok: true, text: `${SETUP_REL} в репозитории нет — после обновления запускать нечего` };
+  for (const [bin, pre] of [['python3', []], ['python', []], ['py', ['-3']]]) {
+    const res = spawn(bin, [...pre, file]);
+    if (res.error && res.error.code === 'ENOENT') continue;
+    const text = `${res.stdout || ''}${res.stderr || ''}`.trim() || (res.error ? String(res.error.message) : '');
+    return { ran: true, ok: res.status === 0, text: `${SETUP_REL} (${bin}) — ${res.status === 0 ? 'пройден' : `код ${res.status ?? 'нет'}`}${text ? `\n${text.split('\n').map((l) => `  | ${l}`).join('\n')}` : ''}` };
+  }
+  return { ran: true, ok: false, text: `${SETUP_REL} не запустился: python не найден (python3, python, py)` };
+}
+
 /** @param {object} rec */
 function remember(rec) {
   try { fs.writeFileSync(STATE_FILE, `${JSON.stringify(rec, null, 1)}\n`); } catch { /* the check stands without its note */ }
@@ -177,6 +208,11 @@ async function run(argv) {
     }
     out.push(updated.length ? `обновлено из репозитория: ${updated.length} — ${updated.join(', ')}` : 'обновлять нечего');
     defects = compare(scanLocal(SKILL_DIR, src.local), files);
+    if (updated.length && !defects.length) {
+      const setup = runSetup(SKILL_DIR);
+      out.push(setup.text);
+      if (!setup.ok) defects.push({ code: 'setup_failed', subject: SETUP_REL });
+    }
   }
   out.push(`сверено файлов: ${files.size}${src.local.length ? `; память скилла не сверяется: ${src.local.join(', ')}` : ''}`);
   const ok = !defects.length;
@@ -227,6 +263,17 @@ function selftest() {
   write('source-ok.json', '{"repo": "pg3d-skill/aghanim-offer-building", "local": ["catalog/live.json"]}\n');
   const src = readSource(path.join(dir, 'source-ok.json'));
   expect('branch defaults to main', src.branch === 'main' && src.repo === 'pg3d-skill/aghanim-offer-building' && src.local.length === 1);
+
+  const calls = [];
+  const fakeSpawn = (answers) => (bin, args) => { calls.push(bin); return answers[bin] || { status: null, error: Object.assign(new Error('not found'), { code: 'ENOENT' }) }; };
+  const none = runSetup(dir, fakeSpawn({}));
+  expect('no setup.py: nothing is run and the update stands', !none.ran && none.ok && calls.length === 0);
+  write(SETUP_REL, 'print("ok")\n');
+  const green = runSetup(dir, fakeSpawn({ python: { status: 0, stdout: 'Done: всё на месте\n' } }));
+  expect('setup.py runs with the first python that starts', green.ran && green.ok && calls.join() === 'python3,python' && green.text.includes('| Done: всё на месте'));
+  expect('a red setup.py makes the verdict red', runSetup(dir, fakeSpawn({ python3: { status: 2, stdout: 'Blocked: нет node\n' } })).ok === false);
+  expect('setup.py without any python is a defect, not a pass', runSetup(dir, fakeSpawn({})).ok === false);
+  expect('setup_failed refusal carries what / why / fix', refusal([{ code: 'setup_failed', subject: SETUP_REL }]).includes('как исправить'));
 
   fs.rmSync(dir, { recursive: true, force: true });
   return fails.length

@@ -53,6 +53,9 @@ const KEY_OF = {
   PriceTemplate: (v) => String(v.price_template_key),
 };
 const STALE_DAYS = 30;
+const REPO_CHECK = path.join(SKILL_DIR, 'scripts', 'check-repo.mjs');
+// Commands that never leave the machine and describe the script itself run without the repository check.
+const OFFLINE_ROUTES = ['--selftest', '--describe', '--sync-docs'];
 
 class Blocked extends Error {}
 
@@ -1656,8 +1659,23 @@ function selftest() {
 
 // ---------- entry ----------
 
+/**
+ * Runs check-repo.mjs before any working command: an install that drifted from the repository does not start.
+ * Fail-closed like the check itself; --no-repo-check skips it and is for the operator's direct word only.
+ * @param {string[]} argv
+ */
+function repoGate(argv) {
+  if (!argv.length || OFFLINE_ROUTES.some((n) => argv.includes(n))) return;
+  if (argv.includes('--no-repo-check')) { console.log('сверка с репозиторием пропущена (--no-repo-check): команды могут расходиться с описанием скилла'); return; }
+  const res = spawnSync(process.execPath, [REPO_CHECK], { encoding: 'utf8', timeout: 120000 });
+  if (res.status === 0) return;
+  console.log(`${res.stdout || ''}${res.stderr || ''}`.trim() || 'Blocked: missing_input — сверка с репозиторием не запустилась: scripts/check-repo.mjs');
+  process.exit(res.status || 2);
+}
+
 async function main() {
   const argv = process.argv.slice(2);
+  repoGate(argv);
   const values = (n) => argv.flatMap((a, i) => (a === n && argv[i + 1] && !argv[i + 1].startsWith('--') ? [argv[i + 1]] : []));
   const flag = (n) => (argv.includes(n) ? values(n)[0] || true : null);
   const abs = (n, v) => { if (typeof v !== 'string' || !path.isAbsolute(v)) throw new Blocked(`${n} ждёт абсолютный путь`); return v; };
