@@ -1,0 +1,11 @@
+{
+ "repo": "pg3d-skill/aghanim-offer-build",
+ "branch": "main",
+ "local": [
+  "catalog/live.json",
+  "catalog/sandbox.json",
+  "catalog/client.json",
+  "catalog/hubs.json",
+  "catalog/image-api.json"
+ ]
+}

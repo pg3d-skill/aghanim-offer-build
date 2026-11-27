@@ -5,14 +5,38 @@ description: "Только PG3D — помнит весь стор, настро
 
 # aghanim-offer-building
 
+## Первый ход — сверка с репозиторием
+
+Перед любой командой скилла, в начале каждой сессии:
+
+```
+node <workspace>/.claude/skills/aghanim-offer-building/scripts/check-repo.mjs
+```
+
+| команда | что делает |
+|---|---|
+| `check-repo.mjs` | сверяет файлы установки с репозиторием-эталоном (коммит ветки, git-отпечаток каждого файла) |
+| `check-repo.mjs --update` | докачивает из репозитория только разошедшиеся и пропавшие файлы; память скилла не трогает, ничего не удаляет |
+| `check-repo.mjs --selftest` | самопроверка сравнения (офлайн) |
+
+Вердикт решает, можно ли работать:
+
+- `Done:` — установка сходится с репозиторием, работать.
+- `Rejected: defects_found` — установка разошлась: назвать оператору, что именно разошлось, и вернуть эталон `--update`. Память скилла — снимки каталога, адреса хабов, путь к клиенту, шов картинок — не сверяется и не переписывается. До зелёного вердикта командами скилла не работать.
+- `Blocked: missing_input` — GitHub недоступен или `catalog/source.json` битый: сверка не прошла, скилл не стартует (fail-closed). Сказать оператору и остановиться; работать без сверки — только по его прямому слову и с оговоркой, что команды могут расходиться с этим описанием.
+
+Эталон — `catalog/source.json`: репозиторий, ветка и файлы, которые живут только на этой машине.
+
 ## Иерархия
 
 ```
 aghanim-offer-building/
 ├── SKILL.md                         # этот файл
+├── README.md
 ├── .gitignore
 ├── catalog/                         # память скилла и конфиги
-│   ├── aghanim-check.sha256         # закреплённый отпечаток scripts/aghanim-check
+│   ├── source.json                  # репозиторий-эталон, ветка и файлы, которые живут только локально
+│   ├── aghanim-check.sha256         # закреплённый отпечаток проверки aghanim API
 │   ├── client.json                  # путь к репозиторию клиента
 │   ├── hubs.json                    # адреса хабов (live / sandbox)
 │   ├── image-api.json               # шов API генерации картинок (заполняет оператор)
@@ -21,43 +45,40 @@ aghanim-offer-building/
 ├── references/
 │   └── how-it-works.generated.md    # описание (build-aghanim-import.mjs --sync-docs)
 └── scripts/
-    ├── setup.py                     # установщик/проверка (Windows + macOS + Linux)
-    ├── aghanim-check                # bash-проверка aghanim API
+    ├── check-repo.mjs               # сверка установки с репозиторием (первый ход, Node)
     ├── build-aghanim-import.mjs     # главный скрипт: сборка файла импорта (Node)
     └── fetch-aghanim-hub.py         # чтение состояния хаба (Python 3.9+)
 ```
 
-## Установка (одна команда, кросс-платформенно)
+## Установка
 
-Работает на Windows, macOS и Linux. Нужны `git`, `python` (3.9+) и `node`.
+Нужны `git` и `node` (18+); для чтения хаба — `python` 3.9+. Имя папки скилла — из фронтматтера
+(`aghanim-offer-building`), а не из имени репозитория.
 
 **macOS / Linux**
 
 ```
-git clone https://github.com/pg3d-skill/aghanim-offer-building \
-  && cd aghanim-offer-building && python3 scripts/setup.py
+git clone https://github.com/pg3d-skill/aghanim-offer-build ~/.claude/skills/aghanim-offer-building \
+  && node ~/.claude/skills/aghanim-offer-building/scripts/check-repo.mjs
 ```
 
-**Windows (PowerShell или cmd)**
+**Windows (PowerShell)**
 
 ```
-git clone https://github.com/pg3d-skill/aghanim-offer-building ; cd aghanim-offer-building ; python scripts\setup.py
+git clone https://github.com/pg3d-skill/aghanim-offer-build $HOME\.claude\skills\aghanim-offer-building ; node $HOME\.claude\skills\aghanim-offer-building\scripts\check-repo.mjs
 ```
 
-`scripts/setup.py` работает в два шага:
+Установка принята, когда все три команды дали `Done:` — сверка с репозиторием и офлайн-самопроверки
+обоих рабочих скриптов:
 
-1. **Сначала сверяет сам себя с GitHub.** Скачивает эталонный `scripts/setup.py` из
-   `raw.githubusercontent.com/.../main/scripts` и сравнивает sha256 с локальным; если это git-клон —
-   дополнительно `git fetch` и сверка всех отслеживаемых файлов с `origin/main`. Если
-   установщик не совпал с GitHub или GitHub недоступен — проверка команд не запускается
-   (fail-closed).
-2. **Потом гоняет проверку всех команд** обоих рабочих скриптов их же офлайн-селфтестами
-   (`build-aghanim-import.mjs --selftest`, `fetch-aghanim-hub.py --selftest`), плюс проверяет
-   версию Python, наличие `node`/`git` и состав файлов.
+```
+node ~/.claude/skills/aghanim-offer-building/scripts/check-repo.mjs
+node ~/.claude/skills/aghanim-offer-building/scripts/build-aghanim-import.mjs --selftest
+python3 ~/.claude/skills/aghanim-offer-building/scripts/fetch-aghanim-hub.py --selftest
+```
 
-`scripts/aghanim-check` установщик дополнительно прогоняет сам, в самом
-начале (`--test`), ещё до сверки с GitHub. Выход `scripts/setup.py` — 0 только
-если всё зелёное.
+Обновление — та же сверка с `--update`: она докачивает разошедшиеся файлы из репозитория и не
+трогает память скилла.
 
 ## Команды главного скрипта
 
