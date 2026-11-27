@@ -7,5 +7,26 @@
   "catalog/client.json",
   "catalog/hubs.json",
   "catalog/image-api.json"
- ]
+ ],
+ "hierarchy": {
+  "SKILL.md": "правила и команды скилла",
+  "README.md": "краткое описание и установка",
+  ".gitignore": "что не попадает в репозиторий",
+  "catalog/": "память скилла и конфиги",
+  "catalog/source.json": "репозиторий-эталон, ветка, файлы, которые живут только локально, и эта иерархия",
+  "catalog/aghanim-check.sha256": "закреплённый отпечаток проверки aghanim API",
+  "catalog/client.json": "путь к репозиторию клиента (локально)",
+  "catalog/hubs.json": "адреса хабов live / sandbox (локально)",
+  "catalog/image-api.json": "шов API генерации картинок, заполняет оператор (локально)",
+  "catalog/live.json": "снимок каталога live (локально)",
+  "catalog/sandbox.json": "снимок каталога sandbox (локально)",
+  "references/": "сгенерированные описания",
+  "references/how-it-works.generated.md": "описание работы скилла (build-aghanim-import.mjs --sync-docs)",
+  "scripts/": "скрипты скилла",
+  "scripts/setup.py": "установщик и проверка установки (Windows + macOS + Linux)",
+  "scripts/check-repo.mjs": "сверка установки с репозиторием, первый ход (Node)",
+  "scripts/aghanim-check": "bash-проверка aghanim API",
+  "scripts/build-aghanim-import.mjs": "главный скрипт: сборка файла импорта (Node)",
+  "scripts/fetch-aghanim-hub.py": "чтение состояния хаба (Python 3.9+)"
+ }
 }
