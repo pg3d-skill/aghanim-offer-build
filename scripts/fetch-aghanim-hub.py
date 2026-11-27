@@ -2,7 +2,8 @@
 """Read live Aghanim hub state from the hub JSON API — as a signed-in player or as a guest.
 
 Before any work the install is compared with its GitHub repository (scripts/check-repo.mjs); a drifted
-install is updated to the repository version, verified and started again. A guest sees only untargeted
+install is updated to the repository version — the update itself runs scripts/setup.py when the repository
+carries one — and the script starts again as the new version. A guest sees only untargeted
 positions, so the script asks whose eyes to look through: --player <User ID> signs in the way the hub's
 own login form does, --guest keeps the guest view. The session token lives in memory only.
 
@@ -33,7 +34,6 @@ else:
 HUBS_FILE = SKILL_DIR / 'catalog' / 'hubs.json'
 IMAGE_API_FILE = SKILL_DIR / 'catalog' / 'image-api.json'
 REPO_CHECK = SKILL_DIR / 'scripts' / 'check-repo.mjs'
-SETUP_SCRIPT = SKILL_DIR / 'scripts' / 'setup.py'
 GATE_ENV = 'AGHANIM_REPO_GATE'
 PLAYER_ENV = 'AGHANIM_HUB_PLAYER'
 API_ORIGIN = 'https://hub-api.aghanim.com'
@@ -167,10 +167,10 @@ def run_tool(command):
     return done.returncode, f'{done.stdout or ''}{done.stderr or ''}'.strip()
 
 
-def repo_gate(run=run_tool, node=None, setup_exists=None):
+def repo_gate(run=run_tool, node=None):
     """-> ('ok' | 'updated' | 'stop', text). Compares the install with its repository before any work; a drifted
-    install is brought to the repository version and verified: scripts/setup.py when the repository carries it,
-    the offline selftest of the fresh code otherwise. Fail-closed: no node, no GitHub or a red check means stop."""
+    install is brought to the repository version by check-repo.mjs --update, which also runs scripts/setup.py
+    when the repository carries one. Fail-closed: no node, no GitHub or a red update means stop."""
     node = node or shutil.which('node')
     if not node or not REPO_CHECK.exists():
         return 'stop', 'Blocked: missing_input — сверка с репозиторием не запустилась: нужны node 18+ и scripts/check-repo.mjs; без сверки — только по прямому слову оператора: --no-repo-check'
@@ -182,13 +182,7 @@ def repo_gate(run=run_tool, node=None, setup_exists=None):
     code, updated = run([node, str(REPO_CHECK), '--update'])
     if code != 0:
         return 'stop', updated
-    has_setup = SETUP_SCRIPT.exists() if setup_exists is None else setup_exists
-    check = [sys.executable, str(SETUP_SCRIPT)] if has_setup else [sys.executable, str(Path(__file__).resolve()), '--selftest']
-    code, verdict = run(check)
-    label = 'scripts/setup.py' if has_setup else 'самопроверка обновлённого кода (scripts/setup.py в репозитории нет)'
-    if code != 0:
-        return 'stop', f'{updated}\nПроверка после обновления — {label}:\n{verdict}\nRejected: defects_found — установка обновлена из репозитория, но проверку не прошла; работа не начата'
-    return 'updated', f'{updated}\nПроверка после обновления — {label}: пройдена'
+    return 'updated', updated
 
 
 def ask_player(args, env=None, stdin=None, ask=input):
@@ -741,18 +735,17 @@ def run_selftest():
     except Blocked as error:
         checks['nobody named and nobody to ask is a refusal'] = error.reason == 'missing_input' and '--guest' in str(error)
 
-    def gate(answers, setup=False):
+    def gate(answers):
         calls = []
 
         def run(command):
             calls.append(' '.join(Path(part).name if os.sep in part else part for part in command[1:]))
             return answers[len(calls) - 1]
-        return repo_gate(run, 'node', setup)[0], calls
+        return repo_gate(run, 'node')[0], calls
 
     checks['repo gate: matching install runs'] = gate([(0, 'Done')]) == ('ok', ['check-repo.mjs'])
-    checks['repo gate: drift is updated and verified by setup.py'] = gate([(1, 'Rejected'), (0, 'Done'), (0, 'ok')], True) == ('updated', ['check-repo.mjs', 'check-repo.mjs --update', 'setup.py'])
-    checks['repo gate: without setup.py the fresh code is self-tested'] = gate([(1, 'Rejected'), (0, 'Done'), (0, 'ok')])[1][2] == 'fetch-aghanim-hub.py --selftest'
-    checks['repo gate: failed verification, failed update and no GitHub stop'] = [gate(a)[0] for a in ([(1, ''), (0, ''), (1, 'bad')], [(1, ''), (1, 'extra file')], [(2, 'Blocked')])] == ['stop', 'stop', 'stop']
+    checks['repo gate: drift is handed to check-repo --update, then restart'] = gate([(1, 'Rejected'), (0, 'Done')]) == ('updated', ['check-repo.mjs', 'check-repo.mjs --update'])
+    checks['repo gate: red update (setup.py, extra file) and no GitHub stop'] = [gate(a)[0] for a in ([(1, ''), (1, 'setup_failed')], [(2, 'Blocked')])] == ['stop', 'stop']
 
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
